@@ -1,4 +1,11 @@
-python-telegram-bot==20.7
+python-telegram-bot>=20.7
 pytz
 python-dateutil
 python-dotenv
+# Optional (install to enable OCR and document parsing):
+# Pillow for image handling and pytesseract for OCR (requires tesseract binary)
+# PyPDF2 for PDF text extraction, python-docx for .docx
+Pillow>=9.0.0; extra == 'ocr'
+pytesseract; extra == 'ocr'
+PyPDF2; extra == 'pdf'
+python-docx; extra == 'docx'
