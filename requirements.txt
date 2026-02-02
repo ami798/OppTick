@@ -9,3 +9,8 @@ Pillow>=9.0.0; extra == 'ocr'
 pytesseract; extra == 'ocr'
 PyPDF2; extra == 'pdf'
 python-docx; extra == 'docx'
+python-telegram-bot[job-queue]>=22.0
+python-dateutil>=2.8
+python-dotenv>=1.0
+pillow>=10.0
+pytesseract>=0.3
