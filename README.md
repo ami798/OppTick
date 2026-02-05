@@ -1,7 +1,7 @@
 
 ## OppTick
 
-OppTick is a Python-based automation bot designed to simplify and streamline repetitive tasks. It is easy to set up, customize, and run, making it ideal for developers and users who want to automate workflows or integrate bot functionalities into their projects.
+OppTick is a Python-based automation bot designed to simplify and streamline repetitive tasks. It is easy to set up, customize and run, making it ideal for developers and users who want to automate workflows or integrate bot functionalities into their projects.
 
 ### Features
 - Simple and lightweight Python bot
@@ -37,7 +37,7 @@ OppTick is a Python-based automation bot designed to simplify and streamline rep
 You can modify `bot.py` to add or change automation tasks according to your requirements. The code is well-commented for easy understanding and extension.
 
 ## Contributing
-Contributions are welcome! Feel free to fork the repository, make changes, and submit a pull request.
+Contributions are welcome! Feel free to fork the repository, make changes and submit a pull request.
 
 ## License
 This project is licensed under the MIT License. See the LICENSE file for details.
