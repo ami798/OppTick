@@ -640,7 +640,6 @@ def main():
             CONFIRM:     [CallbackQueryHandler(confirm_callback, pattern='^save_')],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
-        allow_reentry=True,
     )
 
     application.add_handler(conv_handler)
