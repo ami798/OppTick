@@ -14,7 +14,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters, CallbackQueryHandler, JobQueue
+    ContextTypes, filters, CallbackQueryHandler, JobQueue, ChatMemberHandler
 )
 
 # OCR dependencies
@@ -54,16 +54,39 @@ def init_db():
             priority TEXT,
             description TEXT,
             message_text TEXT,
+            link TEXT,
             archived INTEGER DEFAULT 0,
-            done INTEGER DEFAULT 0
+            done INTEGER DEFAULT 0,
+            missed_notified INTEGER DEFAULT 0
         )
     ''')
+    # Safe migration for existing databases
+    for col, defn in [("link", "TEXT"), ("missed_notified", "INTEGER DEFAULT 0")]:
+        try:
+            c.execute(f"ALTER TABLE opportunities ADD COLUMN {col} {defn}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 init_db()
 
 # Conversation states
-DEADLINE, TYPE, PRIORITY, TITLE, DESCRIPTION, CONFIRM = range(6)
+DEADLINE, TYPE, PRIORITY, TITLE, DESCRIPTION, LINK, CONFIRM = range(7)
+
+INTRO_TEXT = (
+    "👋 *Welcome to OppTick!*\n"
+    "I'm your personal opportunity tracker. Forward or send me any opportunity "
+    "message (text or image) and I'll parse it, confirm details with you, and "
+    "set deadline reminders automatically.\n\n"
+    "📋 *Commands:*\n"
+    "/list — View active opportunities\n"
+    "/summary — Weekly overview\n"
+    "/done <id> — Mark as done\n"
+    "/delete <id> — Delete\n"
+    "/archive <id> — Archive\n"
+    "/cancel — Cancel current input\n\n"
+    "🚀 Forward a message or type opportunity details now!"
+)
 
 # --- Auto-parse helpers ---
 def try_parse_date(text):
@@ -113,22 +136,34 @@ def auto_detect_type(text):
 def auto_detect_description(text):
     lines = text.splitlines()
     if len(lines) > 1:
-        return "\n".join(lines[1:]).strip()[:500]
-    return text.strip()[:500]
+        return "\n".join(lines[1:]).strip()[:500]  # type: ignore[index]
+    return text.strip()[:500]  # type: ignore[index]
+
+def auto_detect_link(text):
+    """Return the first URL found in text, or None."""
+    m = re.search(r'https?://\S+', text or '')
+    return m.group(0).rstrip('.,)>') if m else None
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(INTRO_TEXT, parse_mode='Markdown')
+
+async def new_member_intro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires the moment a user opens a chat with the bot (before /start)."""
+    status = update.my_chat_member.new_chat_member.status
+    if status in ('member', 'administrator'):
+        uid = update.my_chat_member.from_user.id
+        try:
+            await context.bot.send_message(chat_id=uid, text=INTRO_TEXT, parse_mode='Markdown')
+        except Exception as exc:
+            logger.warning('Could not send intro to %s: %s', uid, exc)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
     await update.message.reply_text(
-        "Welcome to OppTickBot! 🚀\n"
-        "Forward or send me opportunity messages (text or images).\n"
-        "I'll parse details, confirm with you, and track deadlines with reminders.\n\n"
-        "Commands:\n"
-        "/list    - View saved\n"
-        "/delete <id>  - Delete\n"
-        "/archive <id> - Archive\n"
-        "/summary - Weekly overview\n"
-        "/done <id>    - Mark as filled/done"
+        '❌ Cancelled. Forward a message or type opportunity details to start again.'
     )
+    return ConversationHandler.END
 
 async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.message
@@ -158,48 +193,60 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     context.user_data['message_text'] = text
 
-    # Auto-detect fields
-    auto_dl = auto_detect_date(text)
+    # Auto-detect all fields
+    auto_dl   = auto_detect_date(text)
     auto_title = auto_detect_title(text)
-    auto_type = auto_detect_type(text)
-    auto_desc = auto_detect_description(text)
+    auto_type  = auto_detect_type(text)
+    auto_desc  = auto_detect_description(text)
+    auto_link  = auto_detect_link(text)
 
     context.user_data['auto_title'] = auto_title
-    context.user_data['auto_type'] = auto_type
-    context.user_data['auto_desc'] = auto_desc
+    context.user_data['auto_type']  = auto_type
+    context.user_data['auto_desc']  = auto_desc
+    context.user_data['auto_link']  = auto_link
 
     if auto_dl:
         context.user_data['deadline'] = auto_dl
         await message.reply_text(
-            f"Detected deadline: {auto_dl.strftime('%Y-%m-%d %H:%M')}\n"
-            "Is this correct? Reply 'yes' or enter a new one (e.g. 'Feb 20')."
+            f"📅 Detected deadline: *{auto_dl.strftime('%Y-%m-%d')}*\n"
+            "Reply *yes* to confirm, or enter a new date (e.g. `2026-05-01`, `Feb 20`):",
+            parse_mode='Markdown'
         )
     else:
-        await message.reply_text("No deadline detected. Please enter one (e.g. 'Feb 20', '2026-03-15'):")
         context.user_data['deadline'] = None
+        await message.reply_text(
+            "❓ No deadline detected.\n"
+            "Please enter one (e.g. `2026-05-01`, `Feb 20`, `next Monday`):",
+            parse_mode='Markdown'
+        )
 
     return DEADLINE
 
 async def deadline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip().lower()
-    if text == 'yes' and context.user_data.get('deadline'):
-        pass
+    text = update.message.text.strip()
+    if text.lower() == 'yes' and context.user_data.get('deadline'):
+        pass  # keep auto-detected date
     else:
         try:
             dl = date_parse(text, fuzzy=True)
             if dl < datetime.now():
-                raise ValueError
+                await update.message.reply_text('⚠️ That date is in the past. Please enter a future date:')
+                return DEADLINE
             context.user_data['deadline'] = dl
         except Exception:
-            await update.message.reply_text("Invalid date. Try again:")
+            await update.message.reply_text(
+                "❌ Couldn't parse that as a date.\n"
+                "Try formats like `2026-05-01`, `Feb 20`, or `next week`.",
+                parse_mode='Markdown'
+            )
             return DEADLINE
 
     auto_type = context.user_data['auto_type']
     keyboard = [['Internship', 'Scholarship', 'Event', 'Job', 'Other']]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
-        f"Detected type: {auto_type}\nWhat type is it? (confirm or choose)",
-        reply_markup=reply_markup
+        f"✅ Deadline set!\n\n🏷️ Detected type: *{auto_type}*\nTap to confirm or choose another:",
+        reply_markup=reply_markup, parse_mode='Markdown'
     )
     return TYPE
 
@@ -207,52 +254,85 @@ async def opp_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['opp_type'] = update.message.text.strip()
     keyboard = [['High 🔥', 'Medium', 'Low']]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    await update.message.reply_text("Priority? (High = extra reminders like 14/2 days)", reply_markup=reply_markup)
+    await update.message.reply_text(
+        "⚡ *Priority level?*\n• High 🔥 — reminders 14/7/3/2/1 days before\n• Medium/Low — 7/3/1 days before",
+        reply_markup=reply_markup, parse_mode='Markdown'
+    )
     return PRIORITY
 
 async def priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['priority'] = update.message.text.strip()
     auto_title = context.user_data['auto_title']
     await update.message.reply_text(
-        f"Detected title: {auto_title}\nConfirm or enter new:"
+        f"📝 Detected title:\n*{auto_title}*\n\nReply *yes* to confirm, or type a new title:",
+        parse_mode='Markdown'
     )
     return TITLE
 
 async def title_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    context.user_data['title'] = text if text.lower() != 'yes' else context.user_data['auto_title']
+    context.user_data['title'] = context.user_data['auto_title'] if text.lower() == 'yes' else text
     auto_desc = context.user_data['auto_desc']
+    preview = (auto_desc[:200] + '…') if len(auto_desc) > 200 else auto_desc
     await update.message.reply_text(
-        f"Detected description:\n{auto_desc}\nConfirm ('yes') or enter new:"
+        f"📄 Detected description:\n{preview}\n\nReply *yes* to confirm, or type a new description:",
+        parse_mode='Markdown'
     )
     return DESCRIPTION
 
 async def description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    if text.lower() == 'yes':
-        context.user_data['description'] = context.user_data['auto_desc']
+    context.user_data['description'] = context.user_data['auto_desc'] if text.lower() == 'yes' else text
+
+    auto_link = context.user_data.get('auto_link')
+    if auto_link:
+        await update.message.reply_text(
+            f"🔗 Detected link:\n{auto_link}\n\nReply *yes* to confirm, paste a different URL, or type *none* to skip:",
+            parse_mode='Markdown'
+        )
     else:
-        context.user_data['description'] = text
+        await update.message.reply_text(
+            "🔗 No link found. Paste a URL (e.g. `https://example.com`) or type *none* to skip:",
+            parse_mode='Markdown'
+        )
+    return LINK
 
-    dl = context.user_data['deadline']
-    typ = context.user_data['opp_type']
-    pri = context.user_data['priority']
+async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text.lower() == 'yes':
+        link = context.user_data.get('auto_link') or ''
+    elif text.lower() == 'none':
+        link = ''
+    else:
+        if re.match(r'https?://\S+', text):
+            link = text
+        else:
+            await update.message.reply_text(
+                "❌ Not a valid URL. Try again or type *none* to skip:",
+                parse_mode='Markdown'
+            )
+            return LINK
+    context.user_data['link'] = link
+
+    dl    = context.user_data['deadline']
+    typ   = context.user_data['opp_type']
+    pri   = context.user_data['priority']
     title = context.user_data['title']
-    desc = context.user_data['description'][:100] + '...' if len(context.user_data['description']) > 100 else context.user_data['description']
-
-    text = (
-        f"Save?\n"
-        f"Title: {title}\n"
-        f"Type: {typ}\n"
-        f"Priority: {pri}\n"
-        f"Deadline: {dl.strftime('%Y-%m-%d %H:%M')}\n"
-        f"Description: {desc}"
+    desc  = context.user_data['description']
+    short = (desc[:100] + '…') if len(desc) > 100 else desc
+    summary_text = (
+        f"💾 *Save this opportunity?*\n\n"
+        f"*Title:* {title}\n"
+        f"*Type:* {typ}  |  *Priority:* {pri}\n"
+        f"*Deadline:* {dl.strftime('%Y-%m-%d')}\n"
+        f"*Description:* {short}\n"
+        f"*Link:* {link or 'None'}"
     )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Yes", callback_data='save_yes'),
-         InlineKeyboardButton("No", callback_data='save_no')]
-    ])
-    await update.message.reply_text(text, reply_markup=keyboard)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton('✅ Save', callback_data='save_yes'),
+        InlineKeyboardButton('❌ Cancel', callback_data='save_no')
+    ]])
+    await update.message.reply_text(summary_text, reply_markup=keyboard, parse_mode='Markdown')
     return CONFIRM
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -260,85 +340,131 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
 
     if query.data == 'save_no':
-        await query.edit_message_text("Cancelled.")
+        context.user_data.clear()
+        await query.edit_message_text('❌ Cancelled. Nothing was saved.')
         return ConversationHandler.END
 
-    user_id = query.from_user.id
-    opp_id = str(uuid.uuid4())[:8]
-    title = context.user_data['title']
-    opp_type = context.user_data['opp_type']
-    deadline = context.user_data['deadline']
-    priority = context.user_data['priority']
-    description = context.user_data['description']
+    user_id      = query.from_user.id
+    opp_id       = str(uuid.uuid4())[:8]
+    title        = context.user_data['title']
+    opp_type     = context.user_data['opp_type']
+    deadline     = context.user_data['deadline']
+    priority     = context.user_data['priority']
+    desc         = context.user_data['description']
     message_text = context.user_data['message_text']
-    deadline_str = deadline.isoformat()
+    link         = context.user_data.get('link', '')
 
     try:
         conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute(
-            'INSERT INTO opportunities (opp_id, user_id, title, opp_type, deadline, priority, description, message_text) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            (opp_id, user_id, title, opp_type, deadline_str, priority, description, message_text)
+        conn.execute(
+            'INSERT INTO opportunities '
+            '(opp_id, user_id, title, opp_type, deadline, priority, description, message_text, link) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (opp_id, user_id, title, opp_type, deadline.isoformat(), priority, desc, message_text, link)
         )
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"DB error: {e}")
-        await query.edit_message_text("Error saving opportunity. Please try again.")
+        logger.error('DB error: %s', e)
+        await query.edit_message_text('⚠️ Error saving. Please try again.')
         return ConversationHandler.END
 
-    await schedule_reminders(context, user_id, opp_id, deadline, priority, title)
+    schedule_reminders(context.job_queue, user_id, opp_id, deadline, priority, title, desc, opp_type, link)
 
-    conf_msg = (
-        f"✅ Saved Opportunity!\n"
-        f"ID: {opp_id}\n"
-        f"Title: {title}\n"
-        f"Type: {opp_type}\n"
-        f"Deadline: {deadline.strftime('%Y-%m-%d %H:%M')}\n"
-        f"Description: {description[:100]}..."
+    short = (desc[:100] + '…') if len(desc) > 100 else desc
+    await query.edit_message_text(
+        f"✅ *Opportunity Saved!*\n\n"
+        f"*ID:* `{opp_id}`\n"
+        f"*Title:* {title}\n"
+        f"*Type:* {opp_type}  |  *Priority:* {priority}\n"
+        f"*Deadline:* {deadline.strftime('%Y-%m-%d')}\n"
+        f"*Description:* {short}\n"
+        f"*Link:* {link or 'None'}\n\n"
+        f"⏰ Reminders scheduled!",
+        parse_mode='Markdown'
     )
-    await query.edit_message_text(conf_msg)
+    context.user_data.clear()
     return ConversationHandler.END
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.job
-    user_id = job.data['user_id']
-    title = job.data['title']
-    opp_id = job.data['opp_id']
-    days_left = job.data.get('days_left')
-    msg = f"⏰ {days_left} left: '{title}' (ID: {opp_id})" if days_left else f"⚠️ TODAY: '{title}' (ID: {opp_id})!"
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Mark as Done ✅", callback_data=f"done_{opp_id}")]
-    ])
-    await context.bot.send_message(chat_id=user_id, text=msg, reply_markup=keyboard)
+    d        = context.job.data
+    user_id  = d['user_id']
+    opp_id   = d['opp_id']
+    title    = d.get('title', '')
+    desc     = d.get('desc', '')
+    opp_type = d.get('opp_type', 'Other')
+    link     = d.get('link', '')
+    days     = d.get('days', 0)
 
-async def schedule_reminders(context, user_id, opp_id, deadline, priority, title):
+    header = f"⏰ *{days} day(s) left!*" if days > 0 else "🚨 *TODAY is the deadline!*"
+    short  = (desc[:120] + '…') if len(desc) > 120 else desc
+    link_line = f"\n🔗 *Link:* {link}" if link else ''
+    msg = (
+        f"{header}\n\n"
+        f"📌 *ID:* `{opp_id}`\n"
+        f"🏷️ *Title:* {title}\n"
+        f"🗂️ *Type:* {opp_type}\n"
+        f"📄 *Description:* {short}"
+        f"{link_line}"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton('✅ Mark as Done', callback_data=f'done_{opp_id}')
+    ]])
+    try:
+        await context.bot.send_message(chat_id=user_id, text=msg, reply_markup=keyboard, parse_mode='Markdown')
+    except Exception as exc:
+        logger.error('Reminder send failed for %s: %s', opp_id, exc)
+
+def schedule_reminders(job_queue, user_id, opp_id, deadline, priority, title, desc='', opp_type='Other', link=''):
+    """Synchronous — safe to call from startup and from confirm_callback."""
     now = datetime.now()
-    reminders_days = [7, 3, 1, 0]
-    if 'High' in priority:
-        reminders_days = [14, 7, 3, 2, 1, 0]
-    for days in reminders_days:
-        remind_time = deadline - timedelta(days=days)
-        if remind_time > now:
-            context.job_queue.run_once(
+    days_list = [14, 7, 3, 2, 1, 0] if 'High' in (priority or '') else [7, 3, 1, 0]
+    for days in days_list:
+        fire_at = deadline - timedelta(days=days)
+        if fire_at > now:
+            job_queue.run_once(
                 send_reminder,
-                when=remind_time,
-                data={'user_id': user_id, 'title': title, 'opp_id': opp_id, 'days_left': f"{days} days" if days else None},
-                name=f"rem_{opp_id}_{days}"
+                when=fire_at,
+                data={'user_id': user_id, 'opp_id': opp_id, 'title': title,
+                      'desc': desc, 'opp_type': opp_type, 'link': link, 'days': days},
+                name=f'rem_{opp_id}_{days}'
             )
 
 async def check_missed(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fires once daily; notifies each overdue opportunity ONCE only."""
     now = datetime.now()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT user_id, opp_id, title FROM opportunities WHERE deadline < ? AND archived = 0 AND done = 0', (now.isoformat(),))
-    missed = c.fetchall()
-    for user_id, opp_id, title in missed:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Mark as Done ✅", callback_data=f"done_{opp_id}")]
-        ])
-        await context.bot.send_message(user_id, f"❌ Missed '{title}' (ID: {opp_id}).", reply_markup=keyboard)
+    c.execute(
+        'SELECT user_id, opp_id, title, description, opp_type, link, deadline '
+        'FROM opportunities '
+        'WHERE deadline < ? AND archived = 0 AND done = 0 AND missed_notified = 0',
+        (now.isoformat(),)
+    )
+    for uid, opp_id, title, desc, opp_type, link, dl_str in c.fetchall():
+        try:
+            dl    = datetime.fromisoformat(str(dl_str))
+            desc_s = str(desc) if desc else ''
+            short  = (desc_s[:100] + '…') if len(desc_s) > 100 else desc_s
+            link_line = f'\n🔗 *Link:* {link}' if link else ''
+            msg = (
+                f"❌ *Missed Opportunity!*\n\n"
+                f"*ID:* `{opp_id}`\n"
+                f"*Title:* {title}\n"
+                f"*Type:* {opp_type}\n"
+                f"*Deadline was:* {dl.strftime('%Y-%m-%d')}\n"
+                f"*Description:* {short}"
+                f"{link_line}\n\n"
+                "Mark as done to keep your list clean. ☑️"
+            )
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton('✅ Mark as Done', callback_data=f'done_{opp_id}')
+            ]])
+            await context.bot.send_message(chat_id=uid, text=msg, reply_markup=keyboard, parse_mode='Markdown')
+            conn.execute('UPDATE opportunities SET missed_notified = 1 WHERE opp_id = ?', (opp_id,))
+            conn.commit()
+        except Exception as exc:
+            logger.error('Missed-notify failed for %s: %s', opp_id, exc)
     conn.close()
 
 async def mark_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -466,23 +592,27 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.warning('Update caused error: %s', context.error)
 
 # --- Reschedule reminders on startup ---
-class FakeContext:
-    def __init__(self, job_queue):
-        self.job_queue = job_queue
-        self.bot = None
-
 def reschedule_all_reminders(job_queue: JobQueue):
+    """Re-registers all pending reminders after a bot restart."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT user_id, opp_id, title, deadline, priority FROM opportunities WHERE archived = 0 AND done = 0')
-    opps = c.fetchall()
+    c.execute(
+        'SELECT user_id, opp_id, title, deadline, priority, description, opp_type, link '
+        'FROM opportunities WHERE archived = 0 AND done = 0'
+    )
+    rows = c.fetchall()
     conn.close()
     now = datetime.now()
-    fake_context = FakeContext(job_queue)
-    for user_id, opp_id, title, dl_str, priority in opps:
-        deadline = datetime.fromisoformat(dl_str)
-        if deadline > now:
-            schedule_reminders(fake_context, user_id, opp_id, deadline, priority, title)
+    for user_id, opp_id, title, dl_str, priority, desc, opp_type, link in rows:
+        try:
+            deadline = datetime.fromisoformat(dl_str)
+            if deadline > now:
+                schedule_reminders(
+                    job_queue, user_id, opp_id, deadline,
+                    priority or '', title or '', desc or '', opp_type or 'Other', link or ''
+                )
+        except Exception as exc:
+            logger.error('Startup reschedule failed for %s: %s', opp_id, exc)
 
 # --- Main ---
 def main():
@@ -498,33 +628,33 @@ def main():
 
     conv_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(
-                filters.UpdateType.MESSAGE & ~filters.COMMAND,
-                handle_forward
-            )
+            MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_forward)
         ],
         states={
-            DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, deadline)],
-            TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, opp_type)],
-            PRIORITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, priority)],
-            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title_handler)],
+            DEADLINE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, deadline)],
+            TYPE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, opp_type)],
+            PRIORITY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, priority)],
+            TITLE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, title_handler)],
             DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description)],
-            CONFIRM: [CallbackQueryHandler(confirm_callback, pattern='^save_')],
+            LINK:        [MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler)],
+            CONFIRM:     [CallbackQueryHandler(confirm_callback, pattern='^save_')],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
     )
 
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(mark_done_callback, pattern='^done_'))
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("list", list_opps))
-    application.add_handler(CommandHandler("delete", delete))
-    application.add_handler(CommandHandler("archive", archive))
-    application.add_handler(CommandHandler("summary", summary))
-    application.add_handler(CommandHandler("done", done))
+    application.add_handler(CommandHandler('start',   start))
+    application.add_handler(CommandHandler('list',    list_opps))
+    application.add_handler(CommandHandler('delete',  delete))
+    application.add_handler(CommandHandler('archive', archive))
+    application.add_handler(CommandHandler('summary', summary))
+    application.add_handler(CommandHandler('done',    done))
+    application.add_handler(ChatMemberHandler(new_member_intro, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_error_handler(error_handler)
 
-    print("Bot started - reminders rescheduled.")
+    logger.info('OppTick started.')
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
