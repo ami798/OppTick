@@ -1,12 +1,9 @@
 import os
 import psycopg2
-from psycopg2.extras import RealDictCursor
-from dotenv import load_dotenv
 
-load_dotenv()
 
 class Database:
-    _initialized = False  # class-level flag to prevent repeated init
+    _initialized = False 
 
     def __init__(self, host, database, user, password, port):
         self.conn = psycopg2.connect(
@@ -53,7 +50,7 @@ class Database:
             ''', (opp_id, user_id, title, opp_type, deadline, priority, desc, message_text, link))
 
     def get_missed_opportunities(self, now_iso):
-        with self.conn.cursor(cursor_factory=RealDictCursor) as c:
+        with self.conn.cursor() as c:
             c.execute('''
                 SELECT user_id, opp_id, title, description, opp_type, link, deadline 
                 FROM opportunities 
@@ -71,7 +68,7 @@ class Database:
             return c.rowcount
 
     def get_active_opportunities(self, user_id):
-        with self.conn.cursor(cursor_factory=RealDictCursor) as c:
+        with self.conn.cursor() as c:
             c.execute('''
                 SELECT opp_id, title, opp_type, deadline, priority, description 
                 FROM opportunities 
@@ -90,7 +87,7 @@ class Database:
             return c.rowcount
 
     def get_weekly_summary(self, user_id, now_iso, week_end_iso):
-        with self.conn.cursor(cursor_factory=RealDictCursor) as c:
+        with self.conn.cursor() as c:
             c.execute('''
                 SELECT COUNT(*) as count, opp_type FROM opportunities 
                 WHERE user_id = %s AND deadline >= %s AND deadline <= %s AND archived=0 AND done=0 
@@ -99,7 +96,7 @@ class Database:
             return c.fetchall()
 
     def get_all_active_reminders(self):
-        with self.conn.cursor(cursor_factory=RealDictCursor) as c:
+        with self.conn.cursor() as c:
             c.execute('''
                 SELECT user_id, opp_id, title, deadline, priority, description, opp_type, link 
                 FROM opportunities 

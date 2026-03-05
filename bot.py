@@ -27,8 +27,8 @@ except ImportError:
     OCR_AVAILABLE = False
 
 # Load environment
-if os.path.exists(".env"):
-    load_dotenv()
+
+load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN missing! Set in .env or Railway Variables.")
@@ -41,11 +41,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-host=os.environ["DB_HOST"],
-database=os.environ["DB_NAME"],
-user=os.environ["DB_USER"],
-password=os.environ["DB_PASS"],
-port=os.environ.get("DB_PORT")
+host=os.environ["DB_HOST"]
+database=os.environ["DB_NAME"]
+user=os.environ["DB_USER"]
+password=os.environ["DB_PASS"]
+port=os.environ["DB_PORT"]
 # DB setup
 db = Database(host,database,user,password,port)
 
