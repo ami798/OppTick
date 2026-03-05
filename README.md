@@ -106,5 +106,37 @@ cp .env.example .env
 python bot.py
 ```
 
-**TODO listed in `db.py`**:
-- In `Database.init_db()` there is a TODO to "find a better way to not re-init db on every call". Currently, creating a new `Database` instance triggers `init_db()` which checks and executes `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. Ideally, this should happen once at application startup or via a standalone migration script to avoid unnecessary query overhead.
+### Deployment (Vercel)
+
+You can deploy this bot as a serverless function on Vercel.
+
+1. **Install Vercel CLI**: `npm i -g vercel`
+2. **Deploy**:
+   ```bash
+   vercel --prod
+   ```
+   (You will be asked to authenticate if it's your first time.)
+3. **Set Environment Variables**:
+   If you have a local `.env` file, Vercel can automatically import it during setup.
+   Alternatively, go to your **Vercel Project Settings > Environment Variables** and add:
+   `BOT_TOKEN`, `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASS`, `DB_PORT`.
+
+4. **Set Telegram Webhook**:
+   After deployment, get your Vercel URL (e.g., `https://your-project.vercel.app`) and set the webhook:
+   ```
+   https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://your-project.vercel.app/webhook/
+   ```
+
+5. **Cron Jobs (Reminders)**:
+   - A `vercel.json` file is configured to run a daily cron job that triggers the reminder logic.
+    ```js
+    "schedule": "30 20 * * *"
+    ```
+   - **Note on Free Tier**: Vercel's free tier supports cron jobs but with limitations (e.g., once a day).
+   - Alternatively, you can use an external service like [cron-job.org](https://cron-job.org) to hit `https://your-project.vercel.app/cron` at your preferred frequency.
+
+**TODOs**:
+- `db.py`: In `Database.init_db()` there is a TODO to "find a better way to not re-init db on every call".
+- `web_app.py`: Secure the `/cron` endpoint with a secret token/API key to prevent unauthorized triggering.
+
+
