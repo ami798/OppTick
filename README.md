@@ -56,9 +56,25 @@ So I created **OppTickBot** — a personal tool that turned into something I now
 
 - Python 3.10+
 - [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) v22+ (with job-queue extra)
-- SQLite for storing opportunities
+- PostgreSQL for storing opportunities
 - dateutil + regex for date parsing
 - Pillow + pytesseract (optional) for OCR on images
+
+### Database Structure
+
+The project uses PostgreSQL. The main table is `opportunities` which maps to the following schema:
+- `opp_id` (TEXT PRIMARY KEY): Unique identifier.
+- `user_id` (BIGINT): Telegram user ID.
+- `title` (TEXT): Opportunity title.
+- `opp_type` (TEXT): Category (Internship, Scholarship, Event, etc.).
+- `deadline` (TEXT): Datetime for the deadline.
+- `priority` (TEXT): Priority level.
+- `description` (TEXT): Extracted or user-provided description.
+- `message_text` (TEXT): Original raw text.
+- `link` (TEXT): Related URL.
+- `archived` (INTEGER DEFAULT 0): Whether it is archived.
+- `done` (INTEGER DEFAULT 0): Whether it is completed.
+- `missed_notified` (INTEGER DEFAULT 0): Has user been notified of missing deadline.
 
 ### Setup (Local Development)
 
@@ -74,8 +90,53 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Create .env file with your token
-echo "BOT_TOKEN=your_bot_token_here" > .env
+# 4. Create .env file with your credentials
+cp .env.example .env
+
+# Open the .env file and populate it with your actual values:
+# BOT_TOKEN="your-bot-token"
+# DB_HOST="localhost"
+# DB_NAME="opptick_db"
+# DB_USER="postgres"
+# DB_PASS="password"
+# DB_PORT="5432"
+
 
 # 5. Run the bot
 python bot.py
+```
+
+### Deployment (Vercel)
+
+You can deploy this bot as a serverless function on Vercel.
+
+1. **Install Vercel CLI**: `npm i -g vercel`
+2. **Deploy**:
+   ```bash
+   vercel --prod
+   ```
+   (You will be asked to authenticate if it's your first time.)
+3. **Set Environment Variables**:
+   If you have a local `.env` file, Vercel can automatically import it during setup.
+   Alternatively, go to your **Vercel Project Settings > Environment Variables** and add:
+   `BOT_TOKEN`, `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASS`, `DB_PORT`.
+
+4. **Set Telegram Webhook**:
+   After deployment, get your Vercel URL (e.g., `https://your-project.vercel.app`) and set the webhook:
+   ```
+   https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://your-project.vercel.app/webhook/
+   ```
+
+5. **Cron Jobs (Reminders)**:
+   - A `vercel.json` file is configured to run a daily cron job that triggers the reminder logic.
+    ```js
+    "schedule": "30 20 * * *"
+    ```
+   - **Note on Free Tier**: Vercel's free tier supports cron jobs but with limitations (e.g., once a day).
+   - Alternatively, you can use an external service like [cron-job.org](https://cron-job.org) to hit `https://your-project.vercel.app/cron` at your preferred frequency.
+
+**TODOs**:
+- `db.py`: In `Database.init_db()` there is a TODO to "find a better way to not re-init db on every call".
+- `web_app.py`: Secure the `/cron` endpoint with a secret token/API key to prevent unauthorized triggering.
+
+

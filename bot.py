@@ -1,20 +1,21 @@
 import os
 import logging
-import sqlite3
 import uuid
 import re
 import io
 from datetime import datetime, timedelta
 
-from dotenv import load_dotenv
 from dateutil.parser import parse as date_parse
+
+from db import Database
+from config import BOT_TOKEN,logger, db
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters, CallbackQueryHandler, JobQueue, ChatMemberHandler
+    ContextTypes, filters, CallbackQueryHandler, ChatMemberHandler, JobQueue
 )
 
 # OCR dependencies
@@ -25,50 +26,6 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
-# Load environment
-if os.path.exists(".env"):
-    load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN missing! Set in .env or Railway Variables.")
-
-# Logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# DB setup
-DB_FILE = 'opportunities.db'
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS opportunities (
-            opp_id TEXT PRIMARY KEY,
-            user_id INTEGER,
-            title TEXT,
-            opp_type TEXT,
-            deadline TEXT,
-            priority TEXT,
-            description TEXT,
-            message_text TEXT,
-            link TEXT,
-            archived INTEGER DEFAULT 0,
-            done INTEGER DEFAULT 0,
-            missed_notified INTEGER DEFAULT 0
-        )
-    ''')
-    # Safe migration for existing databases
-    for col, defn in [("link", "TEXT"), ("missed_notified", "INTEGER DEFAULT 0")]:
-        try:
-            c.execute(f"ALTER TABLE opportunities ADD COLUMN {col} {defn}")
-        except sqlite3.OperationalError:
-            pass
-    conn.commit()
-    conn.close()
-init_db()
 
 # Conversation states
 DEADLINE, TYPE, PRIORITY, TITLE, DESCRIPTION, LINK, CONFIRM = range(7)
@@ -355,15 +312,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     link         = context.user_data.get('link', '')
 
     try:
-        conn = sqlite3.connect(DB_FILE)
-        conn.execute(
-            'INSERT INTO opportunities '
-            '(opp_id, user_id, title, opp_type, deadline, priority, description, message_text, link) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (opp_id, user_id, title, opp_type, deadline.isoformat(), priority, desc, message_text, link)
-        )
-        conn.commit()
-        conn.close()
+        db.add_opportunity(opp_id, user_id, title, opp_type, deadline.isoformat(), priority, desc, message_text, link)
     except Exception as e:
         logger.error('DB error: %s', e)
         await query.edit_message_text('⚠️ Error saving. Please try again.')
@@ -433,15 +382,10 @@ def schedule_reminders(job_queue, user_id, opp_id, deadline, priority, title, de
 async def check_missed(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fires once daily; notifies each overdue opportunity ONCE only."""
     now = datetime.now()
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        'SELECT user_id, opp_id, title, description, opp_type, link, deadline '
-        'FROM opportunities '
-        'WHERE deadline < ? AND archived = 0 AND done = 0 AND missed_notified = 0',
-        (now.isoformat(),)
-    )
-    for uid, opp_id, title, desc, opp_type, link, dl_str in c.fetchall():
+    missed = db.get_missed_opportunities(now.isoformat())
+    
+    for row in missed:
+        uid, opp_id, title, desc, opp_type, link, dl_str = row
         try:
             dl    = datetime.fromisoformat(str(dl_str))
             desc_s = str(desc) if desc else ''
@@ -461,11 +405,9 @@ async def check_missed(context: ContextTypes.DEFAULT_TYPE) -> None:
                 InlineKeyboardButton('✅ Mark as Done', callback_data=f'done_{opp_id}')
             ]])
             await context.bot.send_message(chat_id=uid, text=msg, reply_markup=keyboard, parse_mode='Markdown')
-            conn.execute('UPDATE opportunities SET missed_notified = 1 WHERE opp_id = ?', (opp_id,))
-            conn.commit()
+            db.mark_missed_notified(opp_id)
         except Exception as exc:
             logger.error('Missed-notify failed for %s: %s', opp_id, exc)
-    conn.close()
 
 async def mark_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -473,12 +415,7 @@ async def mark_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query.data.startswith('done_'):
         opp_id = query.data.split('_')[1]
         user_id = query.from_user.id
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('UPDATE opportunities SET done=1, archived=1 WHERE opp_id = ? AND user_id = ?', (opp_id, user_id))
-        updated = c.rowcount
-        conn.commit()
-        conn.close()
+        updated = db.mark_done(opp_id, user_id)
         if updated > 0:
             for job in context.job_queue.jobs():
                 if job.name and opp_id in job.name:
@@ -490,11 +427,7 @@ async def mark_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def list_opps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT opp_id, title, opp_type, deadline, priority, description FROM opportunities WHERE user_id = ? AND archived = 0 AND done = 0 ORDER BY deadline', (user_id,))
-    opps = c.fetchall()
-    conn.close()
+    opps = db.get_active_opportunities(user_id)
     if not opps:
         await update.message.reply_text("No active opportunities.")
         return
@@ -513,12 +446,7 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     opp_id = context.args[0]
     user_id = update.message.from_user.id
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('DELETE FROM opportunities WHERE opp_id = ? AND user_id = ?', (opp_id, user_id))
-    deleted = c.rowcount
-    conn.commit()
-    conn.close()
+    deleted = db.delete_opportunity(opp_id, user_id)
     if deleted > 0:
         for job in context.job_queue.jobs():
             if job.name and opp_id in job.name:
@@ -533,12 +461,7 @@ async def archive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     opp_id = context.args[0]
     user_id = update.message.from_user.id
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('UPDATE opportunities SET archived=1 WHERE opp_id = ? AND user_id = ?', (opp_id, user_id))
-    updated = c.rowcount
-    conn.commit()
-    conn.close()
+    updated = db.archive_opportunity(opp_id, user_id)
     if updated > 0:
         for job in context.job_queue.jobs():
             if job.name and opp_id in job.name:
@@ -553,12 +476,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     opp_id = context.args[0]
     user_id = update.message.from_user.id
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('UPDATE opportunities SET done=1, archived=1 WHERE opp_id = ? AND user_id = ?', (opp_id, user_id))
-    updated = c.rowcount
-    conn.commit()
-    conn.close()
+    updated = db.mark_done(opp_id, user_id)
     if updated > 0:
         for job in context.job_queue.jobs():
             if job.name and opp_id in job.name:
@@ -571,15 +489,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     now = datetime.now()
     week_end = now + timedelta(days=7)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        'SELECT COUNT(*), opp_type FROM opportunities '
-        'WHERE user_id = ? AND deadline >= ? AND deadline <= ? AND archived=0 AND done=0 GROUP BY opp_type',
-        (user_id, now.isoformat(), week_end.isoformat())
-    )
-    sums = c.fetchall()
-    conn.close()
+    sums = db.get_weekly_summary(user_id, now.isoformat(), week_end.isoformat())
     if not sums:
         await update.message.reply_text("No upcoming this week.")
         return
@@ -591,41 +501,10 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.warning('Update caused error: %s', context.error)
 
-# --- Reschedule reminders on startup ---
-def reschedule_all_reminders(job_queue: JobQueue):
-    """Re-registers all pending reminders after a bot restart."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        'SELECT user_id, opp_id, title, deadline, priority, description, opp_type, link '
-        'FROM opportunities WHERE archived = 0 AND done = 0'
-    )
-    rows = c.fetchall()
-    conn.close()
-    now = datetime.now()
-    for user_id, opp_id, title, dl_str, priority, desc, opp_type, link in rows:
-        try:
-            deadline = datetime.fromisoformat(dl_str)
-            if deadline > now:
-                schedule_reminders(
-                    job_queue, user_id, opp_id, deadline,
-                    priority or '', title or '', desc or '', opp_type or 'Other', link or ''
-                )
-        except Exception as exc:
-            logger.error('Startup reschedule failed for %s: %s', opp_id, exc)
 
 # --- Main ---
-def main():
-    application = Application.builder().token(BOT_TOKEN).job_queue(JobQueue()).build()
-    reschedule_all_reminders(application.job_queue)
-    if 'missed_job' not in application.bot_data:
-        application.job_queue.run_repeating(
-            check_missed,
-            interval=timedelta(days=1),
-            first=datetime.now() + timedelta(minutes=2)
-        )
-        application.bot_data['missed_job'] = True
-
+def build_application(token):
+    application = Application.builder().token(token).build()
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_forward)
@@ -654,7 +533,13 @@ def main():
     application.add_error_handler(error_handler)
 
     logger.info('OppTick started.')
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # application.run_polling(allowed_updates=Update.ALL_TYPES)
+    return application
 
 if __name__ == '__main__':
-    main()
+    application = build_application(BOT_TOKEN)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+
+
+
