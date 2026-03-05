@@ -56,9 +56,25 @@ So I created **OppTickBot** — a personal tool that turned into something I now
 
 - Python 3.10+
 - [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) v22+ (with job-queue extra)
-- SQLite for storing opportunities
+- PostgreSQL for storing opportunities
 - dateutil + regex for date parsing
 - Pillow + pytesseract (optional) for OCR on images
+
+### Database Structure
+
+The project uses PostgreSQL. The main table is `opportunities` which maps to the following schema:
+- `opp_id` (TEXT PRIMARY KEY): Unique identifier.
+- `user_id` (BIGINT): Telegram user ID.
+- `title` (TEXT): Opportunity title.
+- `opp_type` (TEXT): Category (Internship, Scholarship, Event, etc.).
+- `deadline` (TEXT): Datetime for the deadline.
+- `priority` (TEXT): Priority level.
+- `description` (TEXT): Extracted or user-provided description.
+- `message_text` (TEXT): Original raw text.
+- `link` (TEXT): Related URL.
+- `archived` (INTEGER DEFAULT 0): Whether it is archived.
+- `done` (INTEGER DEFAULT 0): Whether it is completed.
+- `missed_notified` (INTEGER DEFAULT 0): Has user been notified of missing deadline.
 
 ### Setup (Local Development)
 
@@ -74,8 +90,21 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Create .env file with your token
-echo "BOT_TOKEN=your_bot_token_here" > .env
+# 4. Create .env file with your credentials
+cp .env.example .env
+
+# Open the .env file and populate it with your actual values:
+# BOT_TOKEN="your-bot-token"
+# DB_HOST="localhost"
+# DB_NAME="opptick_db"
+# DB_USER="postgres"
+# DB_PASS="password"
+# DB_PORT="5432"
+
 
 # 5. Run the bot
 python bot.py
+```
+
+**TODO listed in `db.py`**:
+- In `Database.init_db()` there is a TODO to "find a better way to not re-init db on every call". Currently, creating a new `Database` instance triggers `init_db()` which checks and executes `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. Ideally, this should happen once at application startup or via a standalone migration script to avoid unnecessary query overhead.
