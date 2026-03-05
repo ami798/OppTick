@@ -15,7 +15,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters, CallbackQueryHandler, JobQueue, ChatMemberHandler
+    ContextTypes, filters, CallbackQueryHandler, ChatMemberHandler
 )
 
 # OCR dependencies
@@ -523,34 +523,25 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.warning('Update caused error: %s', context.error)
 
-# --- Reschedule reminders on startup ---
-def reschedule_all_reminders(job_queue: JobQueue):
-    """Re-registers all pending reminders after a bot restart."""
-    rows = db.get_all_active_reminders()
-    now = datetime.now()
-    for user_id, opp_id, title, dl_str, priority, desc, opp_type, link in rows:
-        try:
-            deadline = datetime.fromisoformat(dl_str)
-            if deadline > now:
-                schedule_reminders(
-                    job_queue, user_id, opp_id, deadline,
-                    priority or '', title or '', desc or '', opp_type or 'Other', link or ''
-                )
-        except Exception as exc:
-            logger.error('Startup reschedule failed for %s: %s', opp_id, exc)
+# # --- Reschedule reminders on startup ---
+# def reschedule_all_reminders(job_queue: JobQueue):
+#     """Re-registers all pending reminders after a bot restart."""
+#     rows = db.get_all_active_reminders()
+#     now = datetime.now()
+#     for user_id, opp_id, title, dl_str, priority, desc, opp_type, link in rows:
+#         try:
+#             deadline = datetime.fromisoformat(dl_str)
+#             if deadline > now:
+#                 schedule_reminders(
+#                     job_queue, user_id, opp_id, deadline,
+#                     priority or '', title or '', desc or '', opp_type or 'Other', link or ''
+#                 )
+#         except Exception as exc:
+#             logger.error('Startup reschedule failed for %s: %s', opp_id, exc)
 
 # --- Main ---
-def main():
-    application = Application.builder().token(BOT_TOKEN).job_queue(JobQueue()).build()
-    reschedule_all_reminders(application.job_queue)
-    if 'missed_job' not in application.bot_data:
-        application.job_queue.run_repeating(
-            check_missed,
-            interval=timedelta(days=1),
-            first=datetime.now() + timedelta(minutes=2)
-        )
-        application.bot_data['missed_job'] = True
-
+def build_application(token):
+    application = Application.builder().token(token).build()
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_forward)
@@ -579,7 +570,13 @@ def main():
     application.add_error_handler(error_handler)
 
     logger.info('OppTick started.')
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # application.run_polling(allowed_updates=Update.ALL_TYPES)
+    return application
 
 if __name__ == '__main__':
-    main()
+    application = build_application(BOT_TOKEN)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+
+
+
