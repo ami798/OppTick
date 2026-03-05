@@ -5,17 +5,17 @@ import re
 import io
 from datetime import datetime, timedelta
 
-from dotenv import load_dotenv
 from dateutil.parser import parse as date_parse
 
 from db import Database
+from config import BOT_TOKEN,logger, db
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters, CallbackQueryHandler, ChatMemberHandler
+    ContextTypes, filters, CallbackQueryHandler, ChatMemberHandler, JobQueue
 )
 
 # OCR dependencies
@@ -26,28 +26,6 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
-# Load environment
-
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN missing! Set in .env or Railway Variables.")
-
-# Logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-
-host=os.environ["DB_HOST"]
-database=os.environ["DB_NAME"]
-user=os.environ["DB_USER"]
-password=os.environ["DB_PASS"]
-port=os.environ["DB_PORT"]
-# DB setup
-db = Database(host,database,user,password,port)
 
 # Conversation states
 DEADLINE, TYPE, PRIORITY, TITLE, DESCRIPTION, LINK, CONFIRM = range(7)
@@ -523,21 +501,6 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.warning('Update caused error: %s', context.error)
 
-# # --- Reschedule reminders on startup ---
-# def reschedule_all_reminders(job_queue: JobQueue):
-#     """Re-registers all pending reminders after a bot restart."""
-#     rows = db.get_all_active_reminders()
-#     now = datetime.now()
-#     for user_id, opp_id, title, dl_str, priority, desc, opp_type, link in rows:
-#         try:
-#             deadline = datetime.fromisoformat(dl_str)
-#             if deadline > now:
-#                 schedule_reminders(
-#                     job_queue, user_id, opp_id, deadline,
-#                     priority or '', title or '', desc or '', opp_type or 'Other', link or ''
-#                 )
-#         except Exception as exc:
-#             logger.error('Startup reschedule failed for %s: %s', opp_id, exc)
 
 # --- Main ---
 def build_application(token):
